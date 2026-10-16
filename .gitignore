@@ -2,3 +2,6 @@ __pycache__/
 *.zip
 credentials.py
 training_dataset.csv
+
+# Local Python environment
+approach2/.venv/
