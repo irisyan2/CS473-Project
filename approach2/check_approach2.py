@@ -12,7 +12,7 @@ import os; ap.add_argument("--assets", default="local_assets/assets.json" if os.
 assets = json.load(open(args.assets)) if args.assets else None
 df = pd.read_csv(args.csv); fold = T.make_folds(df)
 cfg = json.load(open("weights/approach2_config.json"))
-E = T.get_embeddings(df, cfg["encoder"], assets)
+E = T.get_combined(df, cfg["encoders"], assets)
 tr, va = fold != 0, fold == 0
 with tempfile.TemporaryDirectory() as tmp:
     T.fit_artifacts(df[tr], E[tr], cfg, tmp)

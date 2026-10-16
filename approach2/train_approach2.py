@@ -1,6 +1,6 @@
 """Local-only: cross-validate Approach 2 and write the artifacts to weights/.
 
-  python train_approach2.py --csv training_dataset.csv
+  python train_approach2.py --csv training_dataset.csv [--assets local_assets/assets.json]
 Outputs: folds.csv (reuse for approaches 1 & 3), cache/emb_<enc>.npy,
          results_approach2.csv, weights/approach2_knn.npz + approach2_config.json
 """
@@ -11,10 +11,11 @@ from sklearn.metrics import cohen_kappa_score
 from sklearn.model_selection import StratifiedKFold
 import approach2 as A
 
-ENCODERS = ["minilm", "bge_small"]          # compare >= 2 (add multiqa_minilm, e5_small if time)
-KS = [1, 3, 5, 7, 10, 15, 20, 30, 50]
-WEIGHTINGS = ["uniform", "softmax"]
+ENCODER_SETS = [["minilm"], ["bge_small"], ["minilm", "bge_small"]]  # >=2 encoders compared
+KS = [5, 10, 20, 30, 50, 80]
+TEMPS = [0.05, 0.1, 0.2, 1e6]          # 1e6 == uniform weights
 AGGS = ["vote", "mean"]
+CENTERS = [False, True]                # ablation: per-question centering off / on
 N_FOLDS, SEED = 5, 42
 
 
@@ -40,6 +41,10 @@ def get_embeddings(df, enc, assets=None):
     return E
 
 
+def get_combined(df, names, assets=None):
+    return A.l2(np.hstack([get_embeddings(df, n, assets) for n in names]))
+
+
 def qwk(y, p, allowed):
     if len(set(y)) < 2 and len(set(p)) < 2:
         return 1.0 if list(y)[:1] == list(p)[:1] else 0.0
@@ -47,57 +52,72 @@ def qwk(y, p, allowed):
 
 
 def cross_validate(df, E, fold, classes):
-    configs = list(itertools.product(KS, WEIGHTINGS, AGGS))
+    configs = list(itertools.product(CENTERS, KS, TEMPS, AGGS))
     pred = {c: np.zeros(len(df), dtype=int) for c in configs}
-    y = df["Score1"].to_numpy(); es = df["EssaySet"].to_numpy()
-    kmax = max(KS)
+    y = df["Score1"].to_numpy(); es = df["EssaySet"].to_numpy(); kmax = max(KS)
     for f in range(N_FOLDS):
         for q in np.unique(es):
             tr = np.where((es == q) & (fold != f))[0]; va = np.where((es == q) & (fold == f))[0]
-            sims = E[va] @ E[tr].T
-            idx = np.argsort(-sims, axis=1)[:, :kmax]
-            s = np.take_along_axis(sims, idx, axis=1); lab = y[tr][idx]
-            for (k, wt, ag) in configs:
-                pred[(k, wt, ag)][va] = A.aggregate(lab[:, :k], A.weights_for(s[:, :k], wt), classes[q], ag)
+            mu = E[tr].mean(0)  # fit on the training part only
+            for center in CENTERS:
+                Etr, Eva = (A.l2(E[tr] - mu), A.l2(E[va] - mu)) if center else (E[tr], E[va])
+                sims = Eva @ Etr.T
+                idx = np.argsort(-sims, axis=1)[:, :kmax]
+                s = np.take_along_axis(sims, idx, axis=1); lab = y[tr][idx]
+                for (c0, k, t, ag) in configs:
+                    if c0 == center:
+                        pred[(c0, k, t, ag)][va] = A.aggregate(lab[:, :k], A.weights_for(s[:, :k], t),
+                                                               classes[q], ag)
     rows = []
     for c in configs:
-        per_fold = []
-        for f in range(N_FOLDS):
-            per_q = [qwk(y[(es == q) & (fold == f)], pred[c][(es == q) & (fold == f)], classes[q])
-                     for q in np.unique(es)]
-            per_fold.append(np.mean(per_q))
-        rows.append(dict(k=c[0], weighting=c[1], agg=c[2],
+        per_fold = [np.mean([qwk(y[(es == q) & (fold == f)], pred[c][(es == q) & (fold == f)], classes[q])
+                             for q in np.unique(es)]) for f in range(N_FOLDS)]
+        rows.append(dict(center=c[0], k=c[1], temp=c[2], agg=c[3],
                          mean_qwk=np.mean(per_fold), std_qwk=np.std(per_fold)))
     return pd.DataFrame(rows)
 
 
 def fit_artifacts(df, E, cfg, out_dir):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out / "approach2_knn.npz", emb=E.astype(np.float32),
-                        y=df["Score1"].to_numpy().astype(np.int16),
-                        qid=df["EssaySet"].astype(str).to_numpy().astype("U16"))
+    qs = df["EssaySet"].astype(str).to_numpy().astype("U16")
+    uq = np.unique(qs)
+    zero = np.zeros(E.shape[1])
+    mu = np.stack([E[qs == q].mean(0) if cfg["center"] else zero for q in uq]).astype(np.float32)
+    mu_pool = (E.mean(0) if cfg["center"] else zero).astype(np.float32)
+    np.savez_compressed(out / "approach2_knn.npz", emb=E.astype(np.float16),
+                        y=df["Score1"].to_numpy().astype(np.int16), qid=qs,
+                        mu_qid=uq, mu=mu, mu_pool=mu_pool)
     (out / "approach2_config.json").write_text(json.dumps(cfg))
 
 
-if __name__ == "__main__":
+def main(argv=None):
     ap = argparse.ArgumentParser(); ap.add_argument("--csv", default="training_dataset.csv")
     ap.add_argument("--assets", default="local_assets/assets.json" if Path("local_assets/assets.json").exists() else None)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     assets = json.load(open(args.assets)) if args.assets else None
-    print("Using local assets:" , args.assets)
+    print("Using local assets:", args.assets)
     df = pd.read_csv(args.csv)
     fold = make_folds(df)
     classes = {q: sorted(df.loc[df.EssaySet == q, "Score1"].unique().tolist()) for q in df.EssaySet.unique()}
     all_res = []
-    for enc in ENCODERS:
-        print("Encoding with", enc, flush=True)
-        E = get_embeddings(df, enc, assets)
-        r = cross_validate(df, E, fold, classes); r.insert(0, "encoder", enc); all_res.append(r)
+    for names in ENCODER_SETS:
+        label = "+".join(names)
+        print("Encoders:", label, flush=True)
+        r = cross_validate(df, get_combined(df, names, assets), fold, classes)
+        r.insert(0, "encoders", label); all_res.append(r)
         print(r.sort_values("mean_qwk", ascending=False).head(5).to_string(index=False), flush=True)
     res = pd.concat(all_res).sort_values("mean_qwk", ascending=False)
     res.to_csv("results_approach2.csv", index=False)
+    # ablation summary for the report: best QWK per (encoders, center)
+    print("\nBest per encoder set / centering:\n",
+          res.groupby(["encoders", "center"])["mean_qwk"].max().unstack().round(4).to_string())
     best = res.iloc[0]; print("\nBEST:\n", best)
-    cfg = dict(encoder=best["encoder"], k=int(best["k"]), weighting=best["weighting"], agg=best["agg"],
+    cfg = dict(encoders=best["encoders"].split("+"), center=bool(best["center"]), k=int(best["k"]),
+               temp=float(best["temp"]), agg=str(best["agg"]),
                classes={str(k): v for k, v in classes.items()})
-    fit_artifacts(df, get_embeddings(df, best["encoder"], assets), cfg, "weights")
+    fit_artifacts(df, get_combined(df, cfg["encoders"], assets), cfg, "weights")
     print("Saved artifacts to weights/")
+
+
+if __name__ == "__main__":
+    main()

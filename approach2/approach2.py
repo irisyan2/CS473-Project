@@ -1,8 +1,8 @@
-"""Approach 2: KNN with sentence embeddings (cosine similarity).
+"""Approach 2: KNN with sentence embeddings (cosine similarity), with per-question centering.
 
 Inference only. Artifacts are produced by train_approach2.py:
-  weights/approach2_knn.npz   (emb, y, qid)
-  weights/approach2_config.json (encoder, k, weighting, agg, classes)
+  weights/approach2_knn.npz     (emb[float16], y, qid, mu_qid, mu, mu_pool)
+  weights/approach2_config.json (encoders, center, k, temp, agg, classes)
 """
 from pathlib import Path
 import json
@@ -15,7 +15,6 @@ HF_NAMES = {
     "bge_small": "BAAI/bge-small-en-v1.5",
 }
 PREFIX = {"e5_small": "query: "}  # e5 expects a prefix; others need none
-TEMP = 0.05  # softmax temperature for similarity weighting
 
 
 # ---------------------------------------------------------------- encoder
@@ -43,11 +42,19 @@ def encode_texts(encoder, texts, name):
     return emb.astype(np.float32)
 
 
+def l2(X):
+    return X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+
+
+def embed(encoders, names, texts):
+    """One or several encoders; each is L2-normalised, then concatenated and re-normalised."""
+    return l2(np.hstack([encode_texts(e, texts, n) for e, n in zip(encoders, names)]))
+
+
 # ---------------------------------------------------------------- KNN core
-def weights_for(sims, weighting):
-    if weighting == "softmax":
-        return np.exp((sims - sims.max(axis=1, keepdims=True)) / TEMP)
-    return np.ones_like(sims)
+def weights_for(sims, temp):
+    """Softmax over cosine similarity; a huge temp (1e6) is plain uniform weighting."""
+    return np.exp((sims - sims.max(axis=1, keepdims=True)) / temp)
 
 
 def aggregate(neigh_labels, w, allowed, agg):
@@ -60,12 +67,12 @@ def aggregate(neigh_labels, w, allowed, agg):
     return allowed[votes.argmax(1)]  # ties -> lower grade
 
 
-def knn_predict(Xq, E, y, k, weighting, agg, allowed):
+def knn_predict(Xq, E, y, k, temp, agg, allowed):
     sims = Xq @ E.T
     k = min(k, E.shape[0])
     idx = np.argsort(-sims, axis=1)[:, :k]
     s = np.take_along_axis(sims, idx, axis=1)
-    return aggregate(y[idx], weights_for(s, weighting), allowed, agg)
+    return aggregate(y[idx], weights_for(s, temp), allowed, agg)
 
 
 # ---------------------------------------------------------------- model
@@ -74,30 +81,38 @@ class KNNEmbeddingModel:
         wd = Path(weights_dir)
         self.cfg = json.loads((wd / "approach2_config.json").read_text())
         d = np.load(wd / "approach2_knn.npz", allow_pickle=False)
-        self.emb, self.y = d["emb"].astype(np.float32), d["y"].astype(np.int64)
+        emb = d["emb"].astype(np.float32)
+        y = d["y"].astype(np.int64)
         qid = d["qid"].astype(str)
-        self.index = {q: (self.emb[qid == q], self.y[qid == q]) for q in np.unique(qid)}
-        self.encoder = get_encoder(self.cfg["encoder"], assets)
+        self.mu = {q: m.astype(np.float32) for q, m in zip(d["mu_qid"].astype(str), d["mu"])}
+        self.mu_pool = d["mu_pool"].astype(np.float32)
+        # centred, re-normalised training vectors per question (+ pooled fallback)
+        self.index = {q: (l2(emb[qid == q] - self.mu[q]), y[qid == q]) for q in np.unique(qid)}
+        self.pool = (l2(emb - self.mu_pool), y)
+        self.names = self.cfg["encoders"]
+        self.encoders = [get_encoder(n, assets) for n in self.names]
 
     def _allowed(self, questions, q):
         info = (questions or {}).get(q) or (questions or {}).get(str(q)) or {}
         g = info.get("allowed_grades")
         if g is None:
-            g = self.cfg["classes"].get(str(q), sorted(set(self.y.tolist())))
+            g = self.cfg["classes"].get(str(q), sorted(set(self.pool[1].tolist())))
         return sorted(int(x) for x in g)
 
     def predict(self, test_rows, questions):
         if not test_rows:
             return []
-        X = encode_texts(self.encoder, [r["text"] for r in test_rows], self.cfg["encoder"])
+        X = embed(self.encoders, self.names, [r["text"] for r in test_rows])
         qs = np.array([str(r["question"]) for r in test_rows])
         preds = np.zeros(len(test_rows), dtype=np.int64)
         for q in np.unique(qs):
             rows = np.where(qs == q)[0]
-            E, y = self.index.get(q, (self.emb, self.y))  # unseen question -> pooled
-            allowed = self._allowed(questions, q)
-            preds[rows] = knn_predict(X[rows], E, y, self.cfg["k"],
-                                      self.cfg["weighting"], self.cfg["agg"], allowed)
+            if q in self.index:
+                (E, y), mu = self.index[q], self.mu[q]
+            else:  # unseen question -> pooled training set
+                (E, y), mu = self.pool, self.mu_pool
+            preds[rows] = knn_predict(l2(X[rows] - mu), E, y, self.cfg["k"],
+                                      self.cfg["temp"], self.cfg["agg"], self._allowed(questions, q))
         return [{"id": r["id"], "score": int(p)} for r, p in zip(test_rows, preds)]
 
 
