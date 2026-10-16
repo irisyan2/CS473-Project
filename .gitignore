@@ -1,0 +1,4 @@
+__pycache__/
+*.zip
+credentials.py
+training_dataset.csv
