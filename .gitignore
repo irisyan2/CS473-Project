@@ -8,3 +8,11 @@ approach2/.venv/
 
 # Local models and downloaded assets
 approach2/local_assets/
+
+# Approach 2 experiment outputs
+approach2/cache/
+approach2/folds.csv
+approach2/results_approach2.csv
+
+# Local grader testing copy
+approach2_test/
