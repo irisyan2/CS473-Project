@@ -8,11 +8,11 @@ import approach2 as A
 import train_approach2 as T
 
 ap = argparse.ArgumentParser(); ap.add_argument("--csv", default="training_dataset.csv")
-ap.add_argument("--assets", default=None); args = ap.parse_args()
+import os; ap.add_argument("--assets", default="local_assets/assets.json" if os.path.exists("local_assets/assets.json") else None); args = ap.parse_args()
 assets = json.load(open(args.assets)) if args.assets else None
 df = pd.read_csv(args.csv); fold = T.make_folds(df)
 cfg = json.load(open("weights/approach2_config.json"))
-E = T.get_embeddings(df, cfg["encoder"])
+E = T.get_embeddings(df, cfg["encoder"], assets)
 tr, va = fold != 0, fold == 0
 with tempfile.TemporaryDirectory() as tmp:
     T.fit_artifacts(df[tr], E[tr], cfg, tmp)

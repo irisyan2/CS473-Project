@@ -29,7 +29,10 @@ def get_encoder(name, assets=None):
     if path:  # grader / local assets: offline only
         return SentenceTransformer(str(path), device="cpu",
                                    trust_remote_code=False, local_files_only=True)
-    # local training fallback: download from the hub by name
+    if assets:
+        raise KeyError(f"assets.json has no models['{name}']['path']; "
+                       f"available: {list((assets.get('models') or {}).keys())}")
+    # no assets given at all: download from the hub by name (local training only)
     return SentenceTransformer(HF_NAMES[name], device="cpu", trust_remote_code=False)
 
 

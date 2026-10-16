@@ -30,12 +30,12 @@ def make_folds(df, path="folds.csv"):
     return fold
 
 
-def get_embeddings(df, enc):
+def get_embeddings(df, enc, assets=None):
     p = Path("cache") / f"emb_{enc}.npy"
     p.parent.mkdir(exist_ok=True)
     if p.exists():
         return np.load(p)
-    E = A.encode_texts(A.get_encoder(enc), df["EssayText"].tolist(), enc)
+    E = A.encode_texts(A.get_encoder(enc, assets), df["EssayText"].tolist(), enc)
     np.save(p, E)
     return E
 
@@ -81,14 +81,17 @@ def fit_artifacts(df, E, cfg, out_dir):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--csv", default="training_dataset.csv")
+    ap.add_argument("--assets", default="local_assets/assets.json" if Path("local_assets/assets.json").exists() else None)
     args = ap.parse_args()
+    assets = json.load(open(args.assets)) if args.assets else None
+    print("Using local assets:" , args.assets)
     df = pd.read_csv(args.csv)
     fold = make_folds(df)
     classes = {q: sorted(df.loc[df.EssaySet == q, "Score1"].unique().tolist()) for q in df.EssaySet.unique()}
     all_res = []
     for enc in ENCODERS:
         print("Encoding with", enc, flush=True)
-        E = get_embeddings(df, enc)
+        E = get_embeddings(df, enc, assets)
         r = cross_validate(df, E, fold, classes); r.insert(0, "encoder", enc); all_res.append(r)
         print(r.sort_values("mean_qwk", ascending=False).head(5).to_string(index=False), flush=True)
     res = pd.concat(all_res).sort_values("mean_qwk", ascending=False)
@@ -96,5 +99,5 @@ if __name__ == "__main__":
     best = res.iloc[0]; print("\nBEST:\n", best)
     cfg = dict(encoder=best["encoder"], k=int(best["k"]), weighting=best["weighting"], agg=best["agg"],
                classes={str(k): v for k, v in classes.items()})
-    fit_artifacts(df, get_embeddings(df, best["encoder"]), cfg, "weights")
+    fit_artifacts(df, get_embeddings(df, best["encoder"], assets), cfg, "weights")
     print("Saved artifacts to weights/")
