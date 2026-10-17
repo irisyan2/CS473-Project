@@ -1,6 +1,9 @@
 """Local-only: cross-validate Approach 2 and write the artifacts to weights/.
 
   python train_approach2.py --csv training_dataset.csv [--assets local_assets/assets.json]
+Default (no flags): builds the best-known model (PCA-whitened minilm+bge_small embeddings +
+word TF-IDF hybrid, K=30, temp 0.1, vote; 5-fold CV QWK ~0.5869) and saves it to weights/.
+Use --search for the original centering-only search. Verify with check_approach2.py --folds all.
 Outputs: folds.csv (reuse for approaches 1 & 3), cache/emb_<enc>.npy,
          results_approach2.csv, weights/approach2_knn.npz + approach2_config.json
 """
@@ -81,24 +84,54 @@ def fit_artifacts(df, E, cfg, out_dir):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     qs = df["EssaySet"].astype(str).to_numpy().astype("U16")
     uq = np.unique(qs)
-    zero = np.zeros(E.shape[1])
-    mu = np.stack([E[qs == q].mean(0) if cfg["center"] else zero for q in uq]).astype(np.float32)
-    mu_pool = (E.mean(0) if cfg["center"] else zero).astype(np.float32)
+    extra = {}
+    if cfg.get("transform") == "white":  # per-question PCA whitening (+ pooled fallback)
+        n, a = cfg["pca_dims"], cfg["alpha"]
+        fits = [A.whiten_fit(E[qs == q], n, a) for q in uq]
+        mu = np.stack([f[0] for f in fits]).astype(np.float32)
+        extra["W"] = np.stack([f[1] for f in fits]).astype(np.float32)
+        mu_pool, W_pool = A.whiten_fit(E, n, a)
+        extra["W_pool"] = W_pool
+    else:
+        zero = np.zeros(E.shape[1])
+        mu = np.stack([E[qs == q].mean(0) if cfg["center"] else zero for q in uq]).astype(np.float32)
+        mu_pool = (E.mean(0) if cfg["center"] else zero).astype(np.float32)
+    if cfg.get("tfidf"):  # TF-IDF is refit at load time from the stored training texts
+        texts = df["EssayText"].fillna("").astype(str).tolist()
+        extra["texts_json"] = np.frombuffer(json.dumps(texts).encode("utf-8"), dtype=np.uint8)
     np.savez_compressed(out / "approach2_knn.npz", emb=E.astype(np.float16),
                         y=df["Score1"].to_numpy().astype(np.int16), qid=qs,
-                        mu_qid=uq, mu=mu, mu_pool=mu_pool)
+                        mu_qid=uq, mu=mu, mu_pool=mu_pool, **extra)
     (out / "approach2_config.json").write_text(json.dumps(cfg))
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(); ap.add_argument("--csv", default="training_dataset.csv")
     ap.add_argument("--assets", default="local_assets/assets.json" if Path("local_assets/assets.json").exists() else None)
+    ap.add_argument("--search", action="store_true",
+                    help="run the ORIGINAL centering-only config search (CV ~0.5748) instead of "
+                         "building the default best model")
+    ap.add_argument("--whiten", action="store_true", help="(default behaviour; kept for compatibility)")
+    ap.add_argument("--out-dir", default="weights", help="where to save artifacts")
+    ap.add_argument("--tfidf", choices=["word", "char", "none"], default="word",
+                    help="TF-IDF hybrid similarity kind ('none' = embeddings only)")
+    ap.add_argument("--lam", type=float, default=0.6, help="TF-IDF weight in the hybrid (0..1)")
+    ap.add_argument("--k", type=int, default=30); ap.add_argument("--temp", type=float, default=0.1)
     args = ap.parse_args(argv)
     assets = json.load(open(args.assets)) if args.assets else None
     print("Using local assets:", args.assets)
     df = pd.read_csv(args.csv)
     fold = make_folds(df)
     classes = {q: sorted(df.loc[df.EssaySet == q, "Score1"].unique().tolist()) for q in df.EssaySet.unique()}
+    if not args.search:  # DEFAULT: whitened embeddings + word TF-IDF hybrid (CV QWK ~0.5869)
+        cfg = dict(encoders=["minilm", "bge_small"], center=True, transform="white",
+                   pca_dims=64, alpha=0.5, k=args.k, temp=args.temp, agg="vote",
+                   classes={str(k): v for k, v in classes.items()})
+        if args.tfidf != "none":
+            cfg["tfidf"] = dict(kind=args.tfidf, lam=args.lam)
+        print("Config:", {k: v for k, v in cfg.items() if k != "classes"})
+        fit_artifacts(df, get_combined(df, cfg["encoders"], assets), cfg, args.out_dir)
+        print("Saved artifacts to", args.out_dir); return
     all_res = []
     for names in ENCODER_SETS:
         label = "+".join(names)
@@ -115,8 +148,8 @@ def main(argv=None):
     cfg = dict(encoders=best["encoders"].split("+"), center=bool(best["center"]), k=int(best["k"]),
                temp=float(best["temp"]), agg=str(best["agg"]),
                classes={str(k): v for k, v in classes.items()})
-    fit_artifacts(df, get_combined(df, cfg["encoders"], assets), cfg, "weights")
-    print("Saved artifacts to weights/")
+    fit_artifacts(df, get_combined(df, cfg["encoders"], assets), cfg, args.out_dir)
+    print("Saved artifacts to", args.out_dir)
 
 
 if __name__ == "__main__":
