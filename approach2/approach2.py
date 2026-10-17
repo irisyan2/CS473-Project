@@ -16,8 +16,7 @@ HF_NAMES = {
     "e5_small": "intfloat/e5-small-v2",
     "bge_small": "BAAI/bge-small-en-v1.5",
 }
-# TF-IDF settings for the optional hybrid similarity (cfg["tfidf"] = {"kind", "lam"});
-# must match experiments2_approach2.py
+# TF-IDF settings for the optional hybrid similarity (cfg["tfidf"] = {"word": w, "char": w})
 TFIDF_KW = {"word": dict(analyzer="word", ngram_range=(1, 2), sublinear_tf=True, min_df=1),
             "char": dict(analyzer="char_wb", ngram_range=(2, 5), sublinear_tf=True, min_df=2)}
 PREFIX = {"e5_small": "query: "}  # e5 expects a prefix; others need none
@@ -80,6 +79,9 @@ def aggregate(neigh_labels, w, allowed, agg):
         m = (w * neigh_labels).sum(1) / w.sum(1)
         return allowed[np.abs(m[:, None] - allowed[None, :]).argmin(1)]
     votes = np.stack([(w * (neigh_labels == g)).sum(1) for g in allowed], axis=1)
+    if agg == "median":  # weighted median grade (ordinal-aware, suits QWK)
+        cum = np.cumsum(votes, axis=1)
+        return allowed[(cum >= 0.5 * cum[:, -1:]).argmax(1)]
     return allowed[votes.argmax(1)]  # ties -> lower grade
 
 
@@ -92,6 +94,17 @@ def knn_from_sims(sims, y, k, temp, agg, allowed):
 
 def knn_predict(Xq, E, y, k, temp, agg, allowed):
     return knn_from_sims(Xq @ E.T, y, k, temp, agg, allowed)
+
+
+def tfidf_weights(cfg):
+    """cfg["tfidf"] -> {kind: weight}. New form {"word": 0.3, "char": 0.3}; old {"kind", "lam"}.
+    The embedding similarity gets weight 1 - sum(weights)."""
+    t = cfg.get("tfidf")
+    if not t:
+        return {}
+    if "kind" in t:
+        return {t["kind"]: float(t["lam"])}
+    return {k: float(v) for k, v in t.items() if float(v) > 0}
 
 
 def clean_text(t):
@@ -121,19 +134,21 @@ class KNNEmbeddingModel:
                       for q in np.unique(qid)}
         self.pool = (self._proj(emb, self.mu_pool, self.W_pool), y)
         # optional TF-IDF hybrid: refit per-question vectorizers from the stored training texts
-        self.tfidf = self.cfg.get("tfidf")
+        self.tfw = tfidf_weights(self.cfg)
         self._tf = {}
-        if self.tfidf:
+        if self.tfw:
             self._texts = np.array(json.loads(bytes(d["texts_json"]).decode("utf-8")), dtype=object)
-            self._qid = qid
             for q in np.unique(qid):
-                self._tf[q] = self._fit_tf(self._texts[qid == q])
+                self._tf[q] = self._fit_tfs(self._texts[qid == q])
         self.names = self.cfg["encoders"]
         self.encoders = [get_encoder(n, assets) for n in self.names]
 
-    def _fit_tf(self, texts):
-        v = TfidfVectorizer(**TFIDF_KW[self.tfidf["kind"]])
-        return v, v.fit_transform(list(texts))
+    def _fit_tfs(self, texts):
+        out = {}
+        for kind in self.tfw:
+            v = TfidfVectorizer(**TFIDF_KW[kind])
+            out[kind] = (v, v.fit_transform(list(texts)))
+        return out
 
     @staticmethod
     def _proj(X, mu, W):
@@ -162,15 +177,16 @@ class KNNEmbeddingModel:
             else:  # unseen question -> pooled training set
                 (E, y), mu, W = self.pool, self.mu_pool, self.W_pool
             sims = self._proj(X[rows], mu, W) @ E.T
-            if self.tfidf:
-                if q not in self._tf:  # unseen question -> pooled vectorizer (fit lazily, once)
+            if self.tfw:
+                if q not in self._tf:  # unseen question -> pooled vectorizers (fit lazily, once)
                     if "__pool__" not in self._tf:
-                        self._tf["__pool__"] = self._fit_tf(self._texts)
+                        self._tf["__pool__"] = self._fit_tfs(self._texts)
                     self._tf[q] = self._tf["__pool__"]
-                v, Xtr = self._tf[q]
-                S_tf = (v.transform([clean_text(test_rows[i]["text"]) for i in rows]) @ Xtr.T).toarray()
-                lam = float(self.tfidf["lam"])
-                sims = (1 - lam) * sims + lam * S_tf
+                qt = [clean_text(test_rows[i]["text"]) for i in rows]
+                lam = sum(self.tfw.values())
+                sims = (1 - lam) * sims + sum(
+                    w * (self._tf[q][kind][0].transform(qt) @ self._tf[q][kind][1].T).toarray()
+                    for kind, w in self.tfw.items())
             preds[rows] = knn_from_sims(sims, y, self.cfg["k"],
                                       self.cfg["temp"], self.cfg["agg"], self._allowed(questions, q))
         return [{"id": r["id"], "score": int(p)} for r, p in zip(test_rows, preds)]

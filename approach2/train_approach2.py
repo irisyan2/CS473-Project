@@ -1,9 +1,12 @@
 """Local-only: cross-validate Approach 2 and write the artifacts to weights/.
 
   python train_approach2.py --csv training_dataset.csv [--assets local_assets/assets.json]
-Default (no flags): builds the best-known model (PCA-whitened minilm+bge_small embeddings +
-word TF-IDF hybrid, K=30, temp 0.1, vote; 5-fold CV QWK ~0.5869) and saves it to weights/.
-Use --search for the original centering-only search. Verify with check_approach2.py --folds all.
+Default (no flags): searches PCA-whitened minilm+bge_small embeddings blended with word/char
+TF-IDF similarity (weights, K, temp, vote/mean/median) by 5-fold CV, prints the optimistic best
+and a NESTED estimate, and saves the best model to weights/. (Previous best: CV QWK ~0.5869.)
+  --fixed   skip the search, build one config from --tfidf/--lam/--k/--temp
+  --search  the original centering-only search (~0.5748)
+Verify with check_approach2.py --folds all.
 Outputs: folds.csv (reuse for approaches 1 & 3), cache/emb_<enc>.npy,
          results_approach2.csv, weights/approach2_knn.npz + approach2_config.json
 """
@@ -80,6 +83,65 @@ def cross_validate(df, E, fold, classes):
     return pd.DataFrame(rows)
 
 
+# ---- hybrid search: whitened embeddings + word/char TF-IDF similarity -------------------
+HYB_ENC = ["minilm", "bge_small"]
+PCA_DIMS, PCA_ALPHA = 64, 0.5
+HYB_KS = [20, 30, 50]
+HYB_TEMPS = [0.05, 0.1, 0.2]
+HYB_AGGS = ["vote", "mean", "median"]
+HYB_WEIGHTS = []  # (w_emb, w_word, w_char), sums to 1
+for _we in (0.2, 0.3, 0.4):
+    _r = 1 - _we
+    HYB_WEIGHTS += [(_we, _r, 0.0), (_we, _r / 2, _r / 2), (_we, 0.0, _r)]
+HYB_WEIGHTS = [tuple(round(x, 4) for x in w) for w in HYB_WEIGHTS]
+
+
+def search_hybrid(df, E, fold, classes):
+    """CV over similarity = w_emb*whitened-emb + w_word*word-TFIDF + w_char*char-TFIDF, K, temp, agg.
+    Whitening and TF-IDF are fit on the train part of each fold only (per essay set).
+    Returns (results DataFrame sorted by mean_qwk, nested (mean, std)). The nested score picks the
+    config on the OTHER folds only, so it is a less optimistic estimate than the best row."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    y = df["Score1"].to_numpy(); es = df["EssaySet"].to_numpy()
+    texts = df["EssayText"].fillna("").astype(str).to_numpy()
+    qlist = sorted(np.unique(es)); nq, nf = len(qlist), N_FOLDS
+    cfgs = [(w, k, t, a) for w in HYB_WEIGHTS for k in HYB_KS for t in HYB_TEMPS for a in HYB_AGGS]
+    cidx = {c: i for i, c in enumerate(cfgs)}; nc = len(cfgs); kmax = max(HYB_KS)
+    pred = np.zeros((nc, len(df)), dtype=int)
+    for f in range(nf):
+        for q in qlist:
+            tr = np.where((es == q) & (fold != f))[0]; va = np.where((es == q) & (fold == f))[0]
+            mu, W = A.whiten_fit(E[tr], PCA_DIMS, PCA_ALPHA)
+            proj = lambda X: A.l2((X - mu) @ W)
+            S_e = proj(E[va]) @ proj(E[tr]).T
+            S = {}
+            for kind in ("word", "char"):
+                v = TfidfVectorizer(**A.TFIDF_KW[kind]); Xtr = v.fit_transform(texts[tr])
+                S[kind] = (v.transform(texts[va]) @ Xtr.T).toarray()
+            for w in HYB_WEIGHTS:
+                Sim = w[0] * S_e + w[1] * S["word"] + w[2] * S["char"]
+                idx = np.argsort(-Sim, axis=1)[:, :kmax]
+                s = np.take_along_axis(Sim, idx, axis=1); lab = y[tr][idx]
+                for k in HYB_KS:
+                    for t in HYB_TEMPS:
+                        wt = A.weights_for(s[:, :k], t)
+                        for a in HYB_AGGS:
+                            pred[cidx[(w, k, t, a)], va] = A.aggregate(lab[:, :k], wt, classes[q], a)
+        print("  hybrid search: fold", f, "done", flush=True)
+    Qf = np.zeros((nc, nq, nf)); Qo = np.zeros((nc, nq, nf))
+    for ci in range(nc):
+        for qi, q in enumerate(qlist):
+            m = es == q
+            for f in range(nf):
+                a, b = m & (fold == f), m & (fold != f)
+                Qf[ci, qi, f] = qwk(y[a], pred[ci][a], classes[q])
+                Qo[ci, qi, f] = qwk(y[b], pred[ci][b], classes[q])
+    nested = [Qf[int(np.argmax(Qo[:, :, f].mean(1))), :, f].mean() for f in range(nf)]
+    rows = [dict(w_emb=c[0][0], w_word=c[0][1], w_char=c[0][2], k=c[1], temp=c[2], agg=c[3],
+                 mean_qwk=Qf[i].mean(), std_qwk=Qf[i].mean(0).std()) for i, c in enumerate(cfgs)]
+    return pd.DataFrame(rows).sort_values("mean_qwk", ascending=False), (np.mean(nested), np.std(nested))
+
+
 def fit_artifacts(df, E, cfg, out_dir):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     qs = df["EssaySet"].astype(str).to_numpy().astype("U16")
@@ -109,13 +171,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(); ap.add_argument("--csv", default="training_dataset.csv")
     ap.add_argument("--assets", default="local_assets/assets.json" if Path("local_assets/assets.json").exists() else None)
     ap.add_argument("--search", action="store_true",
-                    help="run the ORIGINAL centering-only config search (CV ~0.5748) instead of "
-                         "building the default best model")
-    ap.add_argument("--whiten", action="store_true", help="(default behaviour; kept for compatibility)")
+                    help="run the ORIGINAL centering-only config search (CV ~0.5748)")
+    ap.add_argument("--fixed", action="store_true",
+                    help="skip all searching; build one fixed config from --tfidf/--lam/--k/--temp")
+    ap.add_argument("--whiten", action="store_true", help="(ignored; kept for compatibility)")
     ap.add_argument("--out-dir", default="weights", help="where to save artifacts")
     ap.add_argument("--tfidf", choices=["word", "char", "none"], default="word",
-                    help="TF-IDF hybrid similarity kind ('none' = embeddings only)")
-    ap.add_argument("--lam", type=float, default=0.6, help="TF-IDF weight in the hybrid (0..1)")
+                    help="--fixed only: TF-IDF kind ('none' = embeddings only)")
+    ap.add_argument("--lam", type=float, default=0.6, help="--fixed only: TF-IDF weight (0..1)")
     ap.add_argument("--k", type=int, default=30); ap.add_argument("--temp", type=float, default=0.1)
     args = ap.parse_args(argv)
     assets = json.load(open(args.assets)) if args.assets else None
@@ -123,14 +186,33 @@ def main(argv=None):
     df = pd.read_csv(args.csv)
     fold = make_folds(df)
     classes = {q: sorted(df.loc[df.EssaySet == q, "Score1"].unique().tolist()) for q in df.EssaySet.unique()}
-    if not args.search:  # DEFAULT: whitened embeddings + word TF-IDF hybrid (CV QWK ~0.5869)
-        cfg = dict(encoders=["minilm", "bge_small"], center=True, transform="white",
-                   pca_dims=64, alpha=0.5, k=args.k, temp=args.temp, agg="vote",
+    if args.fixed:  # one fixed config, no search (fast)
+        cfg = dict(encoders=list(HYB_ENC), center=True, transform="white",
+                   pca_dims=PCA_DIMS, alpha=PCA_ALPHA, k=args.k, temp=args.temp, agg="vote",
                    classes={str(k): v for k, v in classes.items()})
         if args.tfidf != "none":
-            cfg["tfidf"] = dict(kind=args.tfidf, lam=args.lam)
+            cfg["tfidf"] = {args.tfidf: args.lam}
         print("Config:", {k: v for k, v in cfg.items() if k != "classes"})
         fit_artifacts(df, get_combined(df, cfg["encoders"], assets), cfg, args.out_dir)
+        print("Saved artifacts to", args.out_dir); return
+    if not args.search:  # DEFAULT: hybrid search (whitened emb + word/char TF-IDF), then save best
+        E = get_combined(df, HYB_ENC, assets)
+        res, nested = search_hybrid(df, E, fold, classes)
+        res.to_csv("results_approach2.csv", index=False)
+        base = res[(res["w_emb"] == 0.4) & (res["w_word"] == 0.6) & (res["w_char"] == 0)
+                   & (res["k"] == 30) & (res["temp"] == 0.1) & (res["agg"] == "vote")]
+        if len(base):
+            print("previous model (word TF-IDF lam 0.6, K30): mean %.4f" % base["mean_qwk"].iloc[0])
+        print("\nTOP 8:\n", res.head(8).to_string(index=False))
+        best = res.iloc[0]
+        print("\nBEST (optimistic, picked on these folds): mean %.4f std %.4f" % (best["mean_qwk"], best["std_qwk"]))
+        print("NESTED estimate (config chosen on other folds only): mean %.4f std %.4f" % nested)
+        tf = {kd: float(best[c]) for kd, c in (("word", "w_word"), ("char", "w_char")) if best[c] > 0}
+        cfg = dict(encoders=list(HYB_ENC), center=True, transform="white", pca_dims=PCA_DIMS,
+                   alpha=PCA_ALPHA, k=int(best["k"]), temp=float(best["temp"]), agg=str(best["agg"]),
+                   tfidf=tf, classes={str(k): v for k, v in classes.items()})
+        print("Config:", {k: v for k, v in cfg.items() if k != "classes"})
+        fit_artifacts(df, E, cfg, args.out_dir)
         print("Saved artifacts to", args.out_dir); return
     all_res = []
     for names in ENCODER_SETS:
