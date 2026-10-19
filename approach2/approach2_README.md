@@ -12,7 +12,7 @@ The current selected configuration is:
 - **Temperature:** `0.1`
 - **Aggregation:** weighted vote
 - **CV standard deviation:** `0.014381`
-- **Fold-0 check:** mean QWK `0.5474`
+- **Fold-0 check:** mean QWK `0.6199`
 - **Local grader interface test:** passed; returned all `17,207` predictions
 
 The centering ablation showed a substantial improvement:
@@ -32,7 +32,7 @@ These are cross-validation results, not an official leaderboard score.
 - Concatenated embeddings
 - PCA whitening, 64 dimensions, `alpha=0.5`
 - `K=30`, temperature `0.1`, weighted vote
-- Mean CV QWK: `0.5760`, standard deviation `0.0132`
+- Mean CV QWK: `0.6347`, standard deviation `0.0104`
 
 This result is only about `0.0012` above the current baseline and has **not** been integrated into and verified by the production inference pipeline. Treat it as an experiment, not the current submission configuration.
 
