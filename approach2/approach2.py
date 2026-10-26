@@ -1,18 +1,18 @@
-"""Approach 2: k-nearest-neighbour grading on sentence embeddings (cosine similarity).
+"""Approach 2: KNN with sentence embeddings (cosine similarity) -- size-aware version.
 
-Inference only. Artifacts are produced by train_approach2.py:
-  weights/approach2_knn.npz     emb[float16], y, qid, mu_qid, mu, mu_pool
-                                [+ W, W_pool                when transform == "white"]
-                                [+ M_P, M_b                 when a supervised metric is used]
-  weights/approach2_config.json encoders, center, transform, pca_dims, alpha, metric,
-                                k, temp, agg, classes
+Inference only; artifacts come from train_approach2.py:
+  weights/approach2_knn.npz      emb[float16], y[float32], yfrac, qid, mu_qid, mu, mu_pool,
+                                 [W_qid, W, M_P, M_b  for large questions]
+  weights/approach2_config.json  encoders, large_n, groups{large,small}, fallback, classes
 
-Pipeline per essay set: encode (one or more Sentence-BERT models, each L2-normalised, then
-concatenated) -> centre, or PCA-whiten, fitted on that set's training answers -> optional
-supervised LDA/NCA projection of that space -> cosine KNN -> weighted vote / mean / median.
+Per question the stored answers are projected (centred; large questions are also PCA-whitened and
+optionally passed through a supervised NCA metric) and the K nearest by cosine are aggregated.
+Large questions (>= large_n graded answers) and small ones use different settings.
+Grades may be half-points; predictions are snapped to the nearest allowed grade, exact ties upward.
 """
 from pathlib import Path
 import json
+import re
 import numpy as np
 
 HF_NAMES = {
@@ -21,10 +21,16 @@ HF_NAMES = {
     "e5_small": "intfloat/e5-small-v2",
     "bge_small": "BAAI/bge-small-en-v1.5",
 }
-PREFIX = {"e5_small": "query: "}  # e5 expects a prefix; others need none
+PREFIX = {"e5_small": "query: "}  # e5 expects a prefix; the others need none
+_BR = re.compile(r"<br\s*/?>", re.I)
 
 
 # ---------------------------------------------------------------- encoder
+def clean(t):
+    """Some answers contain HTML line breaks; replace them with spaces."""
+    return _BR.sub(" ", t if isinstance(t, str) else "")
+
+
 def get_encoder(name, assets=None):
     import torch
     from sentence_transformers import SentenceTransformer
@@ -43,7 +49,7 @@ def get_encoder(name, assets=None):
 
 
 def encode_texts(encoder, texts, name):
-    texts = [PREFIX.get(name, "") + (t if isinstance(t, str) else "") for t in texts]
+    texts = [PREFIX.get(name, "") + clean(t) for t in texts]
     emb = encoder.encode(texts, batch_size=64, normalize_embeddings=True,
                          convert_to_numpy=True, show_progress_bar=False)
     return emb.astype(np.float32)
@@ -60,8 +66,9 @@ def embed(encoders, names, texts):
 
 # ---------------------------------------------------------------- embedding-space transforms
 def whiten_fit(E, n, alpha):
-    """PCA-whitening fit on E (rows). Returns (mu, W): project with l2((X - mu) @ W)
-    (keeps n components, each scaled by its std-dev ** -alpha)."""
+    """PCA-whitening fit on E (rows). Returns (mu, W): project with l2((X - mu) @ W).
+    Keeps min(n, rows-1) components, each scaled by its std-dev ** -alpha."""
+    n = max(1, min(n, len(E) - 1))
     mu = E.mean(0)
     _, S, Vt = np.linalg.svd(E - mu, full_matrices=False)
     s = S[:n] / np.sqrt(len(E) - 1)
@@ -79,9 +86,8 @@ def project(X, mu, W=None):
 
 def fit_metric(Z, y, kind, dims):
     """Supervised linear projection of (whitened, L2-normalised) vectors Z using grade labels y.
-    kind: "lda" (shrinkage LDA, <= n_grades-1 dims) or "nca" (neighbourhood components, `dims`).
-    Returns (P, b) so the metric-space vector is l2(Z @ P + b). The map is affine, so it is read
-    off sklearn's transform() rather than relying on solver-specific attributes."""
+    Returns (P, b) so the metric-space vector is l2(Z @ P + b)."""
+    y = np.round(np.asarray(y, float) * 2).astype(int)  # class ids (half-point grades -> ints)
     if kind == "lda":
         from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
         est = LinearDiscriminantAnalysis(solver="eigen", shrinkage="auto",
@@ -96,23 +102,32 @@ def fit_metric(Z, y, kind, dims):
 
 
 # ---------------------------------------------------------------- KNN core
+def snap(m, allowed):
+    """Nearest allowed grade; an exact midpoint tie goes to the HIGHER grade."""
+    g = np.asarray(sorted(float(x) for x in allowed))
+    d = np.abs(np.asarray(m, float)[:, None] - g[None, ::-1])  # reversed grid: argmin picks the higher
+    return g[::-1][d.argmin(1)]
+
+
 def weights_for(sims, temp):
     """Softmax over cosine similarity; a huge temp (1e6) is plain uniform weighting."""
     return np.exp((sims - sims.max(axis=1, keepdims=True)) / temp)
 
 
 def aggregate(neigh_labels, w, allowed, agg):
-    """neigh_labels, w: (n, K). Returns int array of predictions in `allowed`.
-    agg: "vote" (weighted majority), "mean" (weighted mean, snapped to a grade),
-    "median" (weighted median grade)."""
-    allowed = np.asarray(sorted(allowed))
+    """neigh_labels, w: (n, K). Returns predictions (floats) on the `allowed` grid.
+    agg: "mean" (weighted mean), "median" (weighted median), "vote" (weighted majority)."""
+    allowed = np.asarray(sorted(float(x) for x in allowed))
+    lab = np.asarray(neigh_labels, float)
     if agg == "mean":
-        m = (w * neigh_labels).sum(1) / w.sum(1)
-        return allowed[np.abs(m[:, None] - allowed[None, :]).argmin(1)]
-    votes = np.stack([(w * (neigh_labels == g)).sum(1) for g in allowed], axis=1)
+        return snap((w * lab).sum(1) / w.sum(1), allowed)
     if agg == "median":
-        cum = np.cumsum(votes, axis=1)
-        return allowed[(cum >= 0.5 * cum[:, -1:]).argmax(1)]
+        o = np.argsort(lab, axis=1)
+        ls, ws = np.take_along_axis(lab, o, 1), np.take_along_axis(w, o, 1)
+        cum = np.cumsum(ws, axis=1)
+        pos = (cum >= 0.5 * cum[:, -1:]).argmax(1)
+        return snap(ls[np.arange(len(ls)), pos], allowed)
+    votes = np.stack([(w * np.isclose(lab, g)).sum(1) for g in allowed], axis=1)
     return allowed[votes.argmax(1)]  # ties -> lower grade
 
 
@@ -124,37 +139,42 @@ def knn_from_sims(sims, y, k, temp, agg, allowed):
     return aggregate(y[idx], weights_for(s, temp), allowed, agg)
 
 
+def _py(p):
+    p = float(p)
+    return int(p) if p.is_integer() else p
+
+
 # ---------------------------------------------------------------- model
 class KNNEmbeddingModel:
     def __init__(self, weights_dir, assets):
         wd = Path(weights_dir)
         self.cfg = json.loads((wd / "approach2_config.json").read_text())
-        if self.cfg.get("tfidf"):
-            raise ValueError("These weights were trained with a TF-IDF component, which this "
-                             "embeddings-only code no longer supports. Retrain with train_approach2.py.")
         d = np.load(wd / "approach2_knn.npz", allow_pickle=False)
         emb = d["emb"].astype(np.float32)
-        y = d["y"].astype(np.int64)
+        y = d["y"].astype(np.float64)
         qid = d["qid"].astype(str)
-        qids = d["mu_qid"].astype(str)
-        self.mu = {q: m.astype(np.float32) for q, m in zip(qids, d["mu"])}
-        self.mu_pool = d["mu_pool"].astype(np.float32)
-        if self.cfg.get("transform") == "white":  # per-question whitening projections
-            self.W = {q: w.astype(np.float32) for q, w in zip(qids, d["W"])}
-            self.W_pool = d["W_pool"].astype(np.float32)
-        else:
-            self.W, self.W_pool = {}, None
-        # projected, L2-normalised training vectors per question (+ pooled fallback)
-        self.index = {q: (project(emb[qid == q], self.mu[q], self.W.get(q)), y[qid == q])
-                      for q in np.unique(qid)}
-        self.pool = (project(emb, self.mu_pool, self.W_pool), y)
-        # optional supervised metric (cfg["metric"] = {"kind", "weight", "dims"})
-        self.metric = self.cfg.get("metric")
-        if self.metric:
-            P, b = dict(zip(qids, d["M_P"])), dict(zip(qids, d["M_b"]))
-            self.mP = {q: P[q].astype(np.float32) for q in self.index}
-            self.mb = {q: b[q].astype(np.float32) for q in self.index}
-            self.mtrain = {q: l2(self.index[q][0] @ self.mP[q] + self.mb[q]) for q in self.index}
+        mu = {q: m.astype(np.float32) for q, m in zip(d["mu_qid"].astype(str), d["mu"])}
+        W = {}
+        if "W" in d.files:
+            W = {q: w.astype(np.float32) for q, w in zip(d["W_qid"].astype(str), d["W"])}
+        met = self.cfg["groups"]["large"].get("metric")
+        MP, Mb = {}, {}
+        if met and "M_P" in d.files:
+            MP = {q: p.astype(np.float32) for q, p in zip(d["W_qid"].astype(str), d["M_P"])}
+            Mb = {q: b.astype(np.float32) for q, b in zip(d["W_qid"].astype(str), d["M_b"])}
+        self.index = {}
+        for q in np.unique(qid):
+            m = qid == q
+            Z = project(emb[m], mu[q], W.get(q))
+            info = dict(Z=Z, y=y[m], mu=mu[q], W=W.get(q),
+                        grp=self.cfg["groups"]["large" if m.sum() >= self.cfg["large_n"] else "small"])
+            if q in MP:
+                info["P"], info["b"] = MP[q], Mb[q]
+                info["Zm"] = l2(Z @ MP[q] + Mb[q])
+            self.index[q] = info
+        self.mu_pool = d["mu_pool"].astype(np.float32)  # pooled fallback for unseen questions
+        self.pool_Z = project(emb, self.mu_pool)
+        self.pool_frac = d["yfrac"].astype(np.float64)
         self.names = self.cfg["encoders"]
         self.encoders = [get_encoder(n, assets) for n in self.names]
 
@@ -162,29 +182,36 @@ class KNNEmbeddingModel:
         info = (questions or {}).get(q) or (questions or {}).get(str(q)) or {}
         g = info.get("allowed_grades")
         if g is None:
-            g = self.cfg["classes"].get(str(q), sorted(set(self.pool[1].tolist())))
-        return sorted(int(x) for x in g)
+            g = self.cfg["classes"].get(str(q), [0, 1, 2, 3])
+        return sorted(float(x) for x in g)
 
     def predict(self, test_rows, questions):
         if not test_rows:
             return []
         X = embed(self.encoders, self.names, [r["text"] for r in test_rows])
         qs = np.array([str(r["question"]) for r in test_rows])
-        preds = np.zeros(len(test_rows), dtype=np.int64)
+        preds = np.zeros(len(test_rows), dtype=np.float64)
         for q in np.unique(qs):
             rows = np.where(qs == q)[0]
+            allowed = self._allowed(questions, q)
             if q in self.index:
-                (E, y), mu, W = self.index[q], self.mu[q], self.W.get(q)
-            else:  # unseen question -> pooled training set
-                (E, y), mu, W = self.pool, self.mu_pool, self.W_pool
-            Z = project(X[rows], mu, W)
-            sims = Z @ E.T  # cosine similarity in the embedding space
-            if self.metric and q in self.mtrain:  # (unseen questions skip the metric component)
-                m = float(self.metric["weight"])
-                sims = (1 - m) * sims + m * (l2(Z @ self.mP[q] + self.mb[q]) @ self.mtrain[q].T)
-            preds[rows] = knn_from_sims(sims, y, self.cfg["k"], self.cfg["temp"], self.cfg["agg"],
-                                        self._allowed(questions, q))
-        return [{"id": r["id"], "score": int(p)} for r, p in zip(test_rows, preds)]
+                info = self.index[q]
+                g = info["grp"]
+                Zq = project(X[rows], info["mu"], info["W"])
+                sims = Zq @ info["Z"].T
+                if "Zm" in info and g.get("metric"):
+                    m = float(g["metric"]["weight"])
+                    sims = (1 - m) * sims + m * (l2(Zq @ info["P"] + info["b"]) @ info["Zm"].T)
+                preds[rows] = knn_from_sims(sims, info["y"], g["k"], g["temp"], g["agg"], allowed)
+            else:
+                # unseen question: nearest answers over ALL questions, scores as a fraction of each
+                # question's maximum, scaled to this question's top grade
+                fb = self.cfg["fallback"]
+                sims = project(X[rows], self.mu_pool) @ self.pool_Z.T
+                frac = knn_from_sims(sims, self.pool_frac, fb["k"], fb["temp"], "mean",
+                                     np.linspace(0, 1, 201))
+                preds[rows] = snap(frac * max(allowed), allowed)
+        return [{"id": r["id"], "score": _py(p)} for r, p in zip(test_rows, preds)]
 
 
 def load_model(weights_dir, config, assets):
