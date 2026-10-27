@@ -3,12 +3,23 @@
 Inference only; artifacts come from train_approach2.py:
   weights/approach2_knn.npz      emb[float16], y[float32], yfrac, qid, mu_qid, mu, mu_pool,
                                  [W_qid, W, M_P, M_b  for large questions]
+                                 [cal_qid, cal_gamma, cal_ybar  when a group uses agg == "cal"]
   weights/approach2_config.json  encoders, large_n, groups{large,small}, fallback, classes
 
 Per question the stored answers are projected (centred; large questions are also PCA-whitened and
 optionally passed through a supervised NCA metric) and the K nearest by cosine are aggregated.
 Large questions (>= large_n graded answers) and small ones use different settings.
 Grades may be half-points; predictions are snapped to the nearest allowed grade, exact ties upward.
+
+agg == "cal" (calibrated mean): the weighted mean of the neighbours' grades is stretched away from
+the question's mean grade by a factor gamma >= 1 before snapping. Neighbour averages regress toward
+the middle, which quadratic-weighted kappa penalises; gamma is chosen per question so the spread of
+leave-one-out predictions on the stored training answers equals the spread of the real grades.
+
+groups.small.xq = {"weight": b} (only with agg == "cal"): the calibrated within-question prediction is
+blended, with weight b, with a prediction from the nearest answers to OTHER questions (their grades
+as a fraction of each question's top grade, scaled to this question's top grade). A tiny question has
+only ~20 labelled answers; this borrows a little generic "what a good answer looks like" signal.
 """
 from pathlib import Path
 import json
@@ -119,6 +130,8 @@ def aggregate(neigh_labels, w, allowed, agg):
     agg: "mean" (weighted mean), "median" (weighted median), "vote" (weighted majority)."""
     allowed = np.asarray(sorted(float(x) for x in allowed))
     lab = np.asarray(neigh_labels, float)
+    if agg == "cal":
+        raise ValueError('agg "cal" needs per-question statistics: use knn_from_sims(..., cal=...)')
     if agg == "mean":
         return snap((w * lab).sum(1) / w.sum(1), allowed)
     if agg == "median":
@@ -131,12 +144,72 @@ def aggregate(neigh_labels, w, allowed, agg):
     return allowed[votes.argmax(1)]  # ties -> lower grade
 
 
-def knn_from_sims(sims, y, k, temp, agg, allowed):
-    """sims: (n_query, n_train) cosine similarities."""
+GAMMA_CAP = 4.0  # largest stretch factor for agg == "cal"
+
+
+def calibrated_cont(lab, w, gamma, ybar):
+    """Weighted mean of neighbour grades stretched away from `ybar` by `gamma` (not yet snapped)."""
+    m = (w * np.asarray(lab, float)).sum(1) / w.sum(1)
+    return ybar + gamma * (m - ybar)
+
+
+def calibrated(lab, w, gamma, ybar, allowed):
+    """Weighted mean of neighbour grades, stretched away from `ybar` by `gamma`, then snapped."""
+    return snap(calibrated_cont(lab, w, gamma, ybar), allowed)
+
+
+def knn_mean(sims, vals, k, temp):
+    """Similarity-weighted mean of `vals` over the k most similar rows (continuous)."""
+    k = min(k, sims.shape[1])
+    idx = np.argsort(-sims, axis=1)[:, :k]
+    w = weights_for(np.take_along_axis(sims, idx, axis=1), temp)
+    return (w * vals[idx]).sum(1) / w.sum(1)
+
+
+def train_sims(Z, Zm=None, weight=0.0):
+    """Cosine similarities among a question's own training answers, built exactly like the
+    query-time similarities (optionally blended with the NCA metric space)."""
+    S = Z @ Z.T
+    if Zm is not None and weight:
+        S = (1 - weight) * S + weight * (Zm @ Zm.T)
+    return S
+
+
+def loo_topk(S, kmax):
+    """Leave-one-out neighbours of each training answer (an answer is never its own neighbour)."""
+    S = np.array(S, dtype=np.float64)
+    np.fill_diagonal(S, -np.inf)
+    kmax = max(0, min(kmax, S.shape[1] - 1))
+    idx = np.argsort(-S, axis=1)[:, :kmax]
+    return idx, np.take_along_axis(S, idx, axis=1)
+
+
+def spread_from_topk(idx, s, y, k, temp, cap=GAMMA_CAP):
+    """(gamma, ybar): stretch that makes the spread of leave-one-out weighted-mean predictions
+    equal the spread of the real grades (gamma is clipped to [1, cap])."""
+    y = np.asarray(y, float); ybar = float(y.mean()); k = min(k, idx.shape[1])
+    if k < 1 or y.std() < 1e-9:
+        return 1.0, ybar
+    w = weights_for(s[:, :k], temp)
+    m = (w * y[idx[:, :k]]).sum(1) / w.sum(1)
+    return (1.0 if m.std() < 1e-9 else float(np.clip(y.std() / m.std(), 1.0, cap))), ybar
+
+
+def fit_spread(S, y, k, temp):
+    idx, s = loo_topk(S, k)
+    return spread_from_topk(idx, s, y, k, temp)
+
+
+def knn_from_sims(sims, y, k, temp, agg, allowed, cal=None):
+    """sims: (n_query, n_train) cosine similarities. cal = (gamma, ybar) for agg == "cal"."""
     k = min(k, sims.shape[1])
     idx = np.argsort(-sims, axis=1)[:, :k]
     s = np.take_along_axis(sims, idx, axis=1)
-    return aggregate(y[idx], weights_for(s, temp), allowed, agg)
+    w = weights_for(s, temp)
+    if agg == "cal":
+        gamma, ybar = cal if cal is not None else (1.0, float(np.mean(y)))
+        return calibrated(y[idx], w, gamma, ybar, allowed)
+    return aggregate(y[idx], w, allowed, agg)
 
 
 def _py(p):
@@ -162,11 +235,15 @@ class KNNEmbeddingModel:
         if met and "M_P" in d.files:
             MP = {q: p.astype(np.float32) for q, p in zip(d["W_qid"].astype(str), d["M_P"])}
             Mb = {q: b.astype(np.float32) for q, b in zip(d["W_qid"].astype(str), d["M_b"])}
+        cal = {}
+        if "cal_gamma" in d.files:
+            cal = {q: (float(g), float(b)) for q, g, b in
+                   zip(d["cal_qid"].astype(str), d["cal_gamma"], d["cal_ybar"])}
         self.index = {}
         for q in np.unique(qid):
             m = qid == q
             Z = project(emb[m], mu[q], W.get(q))
-            info = dict(Z=Z, y=y[m], mu=mu[q], W=W.get(q),
+            info = dict(Z=Z, y=y[m], mu=mu[q], W=W.get(q), cal=cal.get(q),
                         grp=self.cfg["groups"]["large" if m.sum() >= self.cfg["large_n"] else "small"])
             if q in MP:
                 info["P"], info["b"] = MP[q], Mb[q]
@@ -175,6 +252,7 @@ class KNNEmbeddingModel:
         self.mu_pool = d["mu_pool"].astype(np.float32)  # pooled fallback for unseen questions
         self.pool_Z = project(emb, self.mu_pool)
         self.pool_frac = d["yfrac"].astype(np.float64)
+        self.pool_q = qid  # question of each pooled answer (to exclude the question's own answers)
         self.names = self.cfg["encoders"]
         self.encoders = [get_encoder(n, assets) for n in self.names]
 
@@ -202,7 +280,20 @@ class KNNEmbeddingModel:
                 if "Zm" in info and g.get("metric"):
                     m = float(g["metric"]["weight"])
                     sims = (1 - m) * sims + m * (l2(Zq @ info["P"] + info["b"]) @ info["Zm"].T)
-                preds[rows] = knn_from_sims(sims, info["y"], g["k"], g["temp"], g["agg"], allowed)
+                if g["agg"] == "cal" and g.get("xq"):
+                    # calibrated within-question prediction, blended with other questions' neighbours
+                    gam, yb = info["cal"] if info["cal"] is not None else (1.0, float(np.mean(info["y"])))
+                    k_ = min(g["k"], sims.shape[1]); ix = np.argsort(-sims, axis=1)[:, :k_]
+                    w_ = weights_for(np.take_along_axis(sims, ix, axis=1), g["temp"])
+                    cont = calibrated_cont(info["y"][ix], w_, gam, yb)
+                    fb = self.cfg["fallback"]; other = self.pool_q != q
+                    cx = knn_mean(project(X[rows], self.mu_pool) @ self.pool_Z[other].T,
+                                  self.pool_frac[other], fb["k"], fb["temp"]) * max(allowed)
+                    b_ = float(g["xq"]["weight"])
+                    preds[rows] = snap((1 - b_) * cont + b_ * cx, allowed)
+                else:
+                    preds[rows] = knn_from_sims(sims, info["y"], g["k"], g["temp"], g["agg"], allowed,
+                                                cal=info["cal"])
             else:
                 # unseen question: nearest answers over ALL questions, scores as a fraction of each
                 # question's maximum, scaled to this question's top grade
