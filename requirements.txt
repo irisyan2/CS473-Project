@@ -1,0 +1,13 @@
+# Python 3.12 recommended. These are the versions the grader runs (numpy 2.2.6,
+# scikit-learn 1.6.1, NLTK 3.9.2); the saved weights were made with them, and other
+# scikit-learn versions may not load the .joblib files.
+numpy==2.2.6
+scikit-learn==1.6.1
+nltk==3.9.2
+scipy
+pandas
+joblib
+
+# Approach 2 (sentence embeddings)
+torch
+sentence-transformers
