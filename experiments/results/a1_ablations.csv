@@ -1,0 +1,10 @@
+config,original,new,all
+Final model,0.5446,0.4763,0.4839
+Remove low-similarity rule,0.5429,0.3435,0.3657
+Remove length feature,0.5134,0.4478,0.4551
+Add stop-word removal,0.5428,0.4459,0.4567
+Remove vote smoothing,0.5403,0.451,0.4609
+Unweighted vote (no similarity^5),0.5122,0.4609,0.4666
+Remove word view (character only),0.5409,0.4628,0.4714
+Remove stemming,0.5443,0.4672,0.4758
+Fixed K = 25 instead of scaled K,0.5357,0.468,0.4755

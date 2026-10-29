@@ -1,0 +1,8 @@
+config,original,new,all
+"1. Word TF-IDF (stemmed), fixed K = 25",0.4817,0.2931,0.3141
+2. Character 3-5 grams instead of words,0.5044,0.271,0.2969
+3. K scaled to question size,0.5113,0.3128,0.3348
+4. Character 3-6 grams + length feature,0.535,0.3101,0.3351
+5. Low-similarity rule,0.5371,0.4334,0.445
+"6. Add stemmed word view, larger K on small Qs",0.5403,0.451,0.4609
+7. Ordinal vote smoothing (final),0.5446,0.4763,0.4839

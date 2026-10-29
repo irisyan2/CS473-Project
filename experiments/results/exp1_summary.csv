@@ -1,0 +1,4 @@
+approach,original,new,all,lb_min,lb_max
+"Approach 1 (KNN, TF-IDF)",0.5446,0.4763,0.4839,0.366,0.4603
+"Approach 2 (KNN, embeddings)",0.6399,0.4806,0.4983,0.4439,0.4938
+Approach 3 (TF-IDF + Ridge),0.6596,0.4043,0.4326,0.3969,0.4365
